@@ -66,7 +66,19 @@ BlueScope
 [q] Quit
 ---
 ```
-All extracted telemetry is written atomically into automated storage directories under log_dir/ :
+
+## Data Storage & Telemetry
+All extracted telemetry is written atomically into automated storage directories. To ensure compatibility across different operating systems and permission environments, BlueScope dynamically determines the best writable path:
+
+* **Primary Storage:** Saved directly to your OS-approved user state directory (via platformdirs):
+
+    * Linux: ~/.local/state/bluescope/
+    * Windows: C:\Users\<User>\AppData\Local\bluescope\
+    * macOS: ~/Library/Application Support/bluescope/
+
+* **Fallback Storage:** If the primary directory is restricted or non-writable, BlueScope automatically falls back to an internal ./logs/ directory relative to the installation root.
+
+## Log Structures Generated:
 * scan_log_YYYY_MM_DD.json — Aggregated profiles of over-the-air radio traces.
 * discovery_log_YYYY_MM_DD.json — Deep-dive architecture mappings of successfully evaluated targets.
 

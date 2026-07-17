@@ -15,6 +15,7 @@ from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakError, BleakDeviceNotFoundError, BleakBluetoothNotAvailableError
 from dacite import from_dict
+from platformdirs import user_state_path
 import readchar
 from rich.console import Console
 from rich.live import Live
@@ -23,6 +24,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
+APP_NAME = "BlueScope"
 console = Console()
 
 @dataclass
@@ -79,6 +81,7 @@ class DiscoveryManagerEntry:
 class InteractionManager:
     SCAN_TIME_MIN = 5
     SCAN_TIME_MAX = 3600
+    MAC_VALIDATION_PATTERN = r"^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$"
     LOGGER_NAME = "bluescope.interaction"
 
     def __init__(self):
@@ -119,23 +122,27 @@ class InteractionManager:
             return False
     
     def validate_discovery_input(self, user_input: str) -> bool:
-        validation_pattern = r"^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$"
-        if re.match(validation_pattern, user_input) or user_input == "":
+        if self.check_regex_pattern(user_input):
             return True
         else:
-            self.logger.warning("Invalid MAC address format: '%s'", user_input)
+            self.logger.warning("Invalid MAC address to discover: '%s'", user_input)
             return False
     
     def validate_monitoring_input(self, user_input:str) -> bool:
-        validation_pattern = r"^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$"
-        if re.match(validation_pattern, user_input) or user_input == "":
+        if self.check_regex_pattern(user_input):
             return True
         else:
-            self.logger.warning("Invalid MAC address format: '%s'", user_input)
+            self.logger.warning("Invalid MAC address to monitor: '%s'", user_input)
+            return False
+    
+    def check_regex_pattern(self, user_input: str) -> bool:
+        if re.match(self.MAC_VALIDATION_PATTERN, user_input) or user_input == "":
+            return True
+        else:
             return False
 
 class StorageManager:
-    LOG_DIR = "log_dir"
+    LOG_DIR = f"{APP_NAME.lower()}_log_dir"
     CID_DIR = "cid"
     CID_FILE = "cid.csv"
     LOGGER_NAME = "bluescope.storage"
@@ -146,14 +153,22 @@ class StorageManager:
         self.logger = logging.getLogger(self.LOGGER_NAME)
 
     def get_log_dir_path(self) -> pathlib.Path:
+        state_path = user_state_path(appname=APP_NAME.lower(), appauthor=False)
+
+        try:
+            state_path.mkdir(parents=True, exist_ok=True)
+            return state_path
+        except (OSError, PermissionError) as e:
+            self.logger.warning("Failed to create log directory '%s': %s. Trying fallback...", state_path, e)
+
         try:
             file_path = pathlib.Path(__file__).resolve()
             base_path = file_path.parent
-            log_dir_path = base_path / self.LOG_DIR
-            log_dir_path.mkdir(parents=True, exist_ok=True)
-            return log_dir_path
+            fallback_path = base_path / self.LOG_DIR
+            fallback_path.mkdir(parents=True, exist_ok=True)
+            return fallback_path
         except OSError as e:
-            self.logger.error("Failed to access log directory: %s", e)
+            self.logger.error("Critical failure: Could not create any writable log directory: %s.", e)
             raise
         
     async def load_log_async(self, log_type: str) -> dict:
@@ -541,7 +556,6 @@ class MonitoringManager:
             self.logger.info("Monitoring terminated")
 
 class BlueScopeApp:
-    APP_NAME = "BlueScope"
     LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
     LOGGER_NAME = "bluescope"
 
@@ -581,7 +595,7 @@ class BlueScopeApp:
 
     async def display_menu(self):
         menu_text = (
-            f"\n{self.APP_NAME}\n"
+            f"\n{APP_NAME}\n"
             "---\n"
             "[1] Scan for Devices\n"
             "[2] Discover Device Services\n"

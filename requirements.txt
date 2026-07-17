@@ -1,4 +1,5 @@
 bleak
 dacite
+platformdirs
 readchar
 rich
