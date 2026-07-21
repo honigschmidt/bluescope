@@ -23,6 +23,7 @@ from rich.logging import RichHandler
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
+from typing import Any
 
 APP_NAME = "BlueScope"
 console = Console()
@@ -79,14 +80,22 @@ class DiscoveryManagerEntry:
     characteristics: list[DiscoveryManagerCharacteristic] = field(default_factory=list)
 
 class InteractionManager:
-    SCAN_TIME_MIN = 5
-    SCAN_TIME_MAX = 3600
-    MAC_VALIDATION_PATTERN = r"^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$"
+    SCAN_TIME_MIN_SEC = 5
+    SCAN_TIME_MAX_SEC = 3600
+    BT_ADDRESS_VALIDATION_PATTERN = re.compile(
+        r"^("
+        r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"
+        r"|"
+        r"([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}"
+        r"|"
+        r"[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}"
+        r")$"
+    )
     LOGGER_NAME = "bluescope.interaction"
 
     def __init__(self):
         self.message_map = {
-            "scan": f"Enter scan timeout ({self.SCAN_TIME_MIN}-{self.SCAN_TIME_MAX} seconds) or press [ENTER] to exit: ",
+            "scan": f"Enter scan timeout ({self.SCAN_TIME_MIN_SEC}-{self.SCAN_TIME_MAX_SEC} seconds) or press [ENTER] to exit: ",
             "discovery": "Enter device address to discover or press [ENTER] to exit: ",
             "monitoring": "Enter device address to monitor or press [ENTER] to exit: ",
         }
@@ -113,12 +122,12 @@ class InteractionManager:
     def validate_scan_input(self, user_input: str) -> bool:
         if user_input.isdigit():
             user_input = int(user_input)
-            if (user_input >= self.SCAN_TIME_MIN and user_input <= self.SCAN_TIME_MAX):
+            if (user_input >= self.SCAN_TIME_MIN_SEC and user_input <= self.SCAN_TIME_MAX_SEC):
                 return True
         if user_input == "":
             return True
         else:
-            self.logger.warning("Timeout value must be a number between %s and %s seconds", self.SCAN_TIME_MIN, self.SCAN_TIME_MAX)
+            self.logger.warning("Timeout value must be a number between %s and %s seconds", self.SCAN_TIME_MIN_SEC, self.SCAN_TIME_MAX_SEC)
             return False
     
     def validate_discovery_input(self, user_input: str) -> bool:
@@ -136,10 +145,7 @@ class InteractionManager:
             return False
     
     def check_regex_pattern(self, user_input: str) -> bool:
-        if re.match(self.MAC_VALIDATION_PATTERN, user_input) or user_input == "":
-            return True
-        else:
-            return False
+        return bool (self.BT_ADDRESS_VALIDATION_PATTERN.match(user_input)) or user_input == ""
 
 class StorageManager:
     LOG_DIR = f"{APP_NAME.lower()}_log_dir"
@@ -151,6 +157,33 @@ class StorageManager:
         self.last_save_day = datetime.now(timezone.utc).strftime("%Y_%m_%d")
         self.log_dir_path = self.get_log_dir_path()
         self.logger = logging.getLogger(self.LOGGER_NAME)
+        self.write_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
+        self.worker_task: asyncio.Task | None = None
+
+    def start_queue_worker(self) -> None:
+        if self.worker_task is None or self.worker_task.done():
+            self.worker_task = asyncio.create_task(self.queue_worker())
+    
+    async def shutdown_queue_worker(self) -> None:
+        if self.worker_task and not self.worker_task.done():
+            await self.write_queue.put(None)
+            await self.write_queue.join()
+    
+    async def queue_worker(self) -> None:
+        while True:
+            try:
+                queue_item = await self.write_queue.get()
+                if queue_item is None:
+                    self.write_queue.task_done()
+                    break
+                log_type, data = queue_item
+                await self.save_log_async(log_type, data)
+                self.write_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error("Write queue error: %s", e)
+                self.write_queue.task_done()
 
     def get_log_dir_path(self) -> pathlib.Path:
         state_path = user_state_path(appname=APP_NAME.lower(), appauthor=False)
@@ -180,7 +213,7 @@ class StorageManager:
         file_name = f"{log_type}_log_{datetime.now(timezone.utc).strftime('%Y_%m_%d')}.json"
         file_path = os.path.join(self.log_dir_path, file_name)
 
-        def read_and_parse() -> dict:
+        def read_and_parse_sync() -> dict:
             data = {}
             try:
                 with open(file_path, mode="r", encoding="utf-8") as f:
@@ -193,49 +226,49 @@ class StorageManager:
             except Exception as e:
                 self.logger.error("Failed to parse log file '%s': %s", file_name, e)
             return data
-        
-        return await asyncio.to_thread(read_and_parse)
+        return await asyncio.to_thread(read_and_parse_sync)
 
     async def save_log_async(self, log_type: str, data: dict) -> None:
         if not data:
             return None
-
+        await asyncio.to_thread(self.serialize_and_write_sync, log_type, data)
+        
+    def serialize_and_write_sync(self, log_type: str, data: dict) -> None:
+        if not data:
+            return
         current_day = datetime.now(timezone.utc).strftime("%Y_%m_%d")
         if current_day == self.last_save_day:
             file_name = f"{log_type}_log_{current_day}.json"
         else:
             file_name = f"{log_type}_log_{self.last_save_day}.json"
         file_path = os.path.join(self.log_dir_path, file_name)
+        json_data = {}
+        for device_address, device_data in data.items():
+            if isinstance(device_data, dict):
+                json_data[device_address] = device_data
+            else:
+                json_data[device_address] = asdict(device_data)
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(json_data, f, indent=4)
+            self.last_save_day = current_day
+            self.logger.info("Log file '%s' written successfully", file_name)
+        except Exception as e:
+            self.logger.error("Failed to write log file '%s': %s", file_name, e)
 
-        def serialize_and_write():
-            json_data = {}
-            for device_address, device_data in data.items():
-                if isinstance(device_data, dict):
-                    json_data[device_address] = device_data
-                else:
-                    json_data[device_address] = asdict(device_data)
-            try:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(json_data, f, indent=4)
-                self.last_save_day = current_day
-                self.logger.info("Log file '%s' written successfully", file_name)
-            except Exception as e:
-                self.logger.error("Failed to write log file '%s': %s", file_name, e)
-
-        await asyncio.to_thread(serialize_and_write)
-
-    def background_save(self, snapshot: dict[str, ScanManagerEntry]):
-        json_data = {addr: asdict(entry) for addr, entry in snapshot.items()}
+    def background_save(self, log_type: str, data: dict[str, ScanManagerEntry]) -> None:
+        json_data = {addr: asdict(entry) for addr, entry in data.items()}
         try:
             current_loop = asyncio.get_running_loop()
-            current_loop.create_task(self.save_log_async(log_type="scan", data=json_data))
+            self.start_queue_worker()
+            current_loop.call_soon_threadsafe(self.write_queue.put_nowait, (log_type, json_data))
         except RuntimeError:
             try:
-                asyncio.run(self.save_log_async(log_type="scan", data=json_data))
+                self.serialize_and_write_sync(log_type=log_type, data=json_data)
             except Exception as e:
                 self.logger.error("Failed to execute background save: %s", e)
 
-    def get_cid_dir_path(self) -> pathlib.Path:
+    def get_cid_dir_path(self) -> pathlib.Path | None:
         file_path = pathlib.Path(__file__).resolve()
         base_path = file_path.parent
         cid_dir_path = base_path / self.CID_DIR
@@ -251,7 +284,7 @@ class StorageManager:
         try:
             with open(cid_file, mode="r", encoding="utf-8") as f:
                 reader = csv.reader(f)
-                return {rows[0].strip(): rows[1].strip() for rows in reader}
+                return {rows[0].strip().upper(): rows[1].strip() for rows in reader}
         except (FileNotFoundError, PermissionError, UnicodeDecodeError) as e:
             self.logger.error("Failed to load CID registry: %s", e)
             return {}
@@ -282,7 +315,7 @@ class ManufacturerRegistry:
         return self.cid_registry.get(cid_hex, str(manufacturer_id))
 
 class ScanManager:
-        SAVE_INTERVAL = 5
+        SAVE_INTERVAL_SEC = 5
         LOGGER_NAME = "bluescope.scan"
 
         def __init__(
@@ -295,15 +328,15 @@ class ScanManager:
             self.discovered_devices: dict[str, ScanManagerEntry] = {}
             self.new_device_count = 0
             self.known_device_count = 0
-            self.save_interval = self.SAVE_INTERVAL
+            self.save_interval = self.SAVE_INTERVAL_SEC
             self.last_save = time.time()
             self.logger = logging.getLogger(self.LOGGER_NAME)
         
-        def _on_detection(self, device: BLEDevice, advertisement_data: AdvertisementData):
+        def _on_detection(self, device: BLEDevice, advertisement_data: AdvertisementData) -> None:
             current_day = datetime.now(timezone.utc).strftime("%Y_%m_%d")
 
             if current_day != self.storage_manager.last_save_day:
-                self.storage_manager.background_save(self.discovered_devices)
+                self.storage_manager.background_save(log_type="scan", data=self.discovered_devices)
                 self.discovered_devices.clear()
                 self.storage_manager.last_save_day = current_day
                 self.new_device_count = 0
@@ -334,10 +367,10 @@ class ScanManager:
                 console.print(f"[*] {entry.summary_string}")
 
             if time.time() - self.last_save > self.save_interval:
-                self.storage_manager.background_save(self.discovered_devices)
+                self.storage_manager.background_save(log_type="scan", data=self.discovered_devices)
                 self.last_save = time.time()
 
-        async def scan(self, scan_timeout:int = 10):
+        async def scan(self, scan_timeout:int) -> None:
             scanner = BleakScanner(scanning_mode="active", detection_callback=self._on_detection)
             self.discovered_devices = await self.storage_manager.load_log_async(log_type="scan")
             scan_start = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -363,7 +396,7 @@ class ScanManager:
 
 class DiscoveryManager:
     DEVICE_NAME_UUID = "00002a00-0000-1000-8000-00805f9b34fb"
-    DISCOVER_TIMEOUT = 10
+    DISCOVER_TIMEOUT_SEC = 10
     LOGGER_NAME = "bluescope.discovery"
 
     def __init__(self, storage_manager: StorageManager):
@@ -371,14 +404,14 @@ class DiscoveryManager:
         self.device_characteristics: dict[str, DiscoveryManagerEntry] = {}
         self.logger = logging.getLogger(self.LOGGER_NAME)
         
-    def _on_disconnect(self, client: BleakClient):
+    def _on_disconnect(self, client: BleakClient) -> None:
         self.logger.info("Connection to device '%s' closed", client.address)
 
-    async def discover(self, device_address: str):
+    async def discover(self, device_address: str) -> None:
         client = BleakClient(
             address_or_ble_device=device_address,
             disconnected_callback=self._on_disconnect,
-            timeout=self.DISCOVER_TIMEOUT,
+            timeout=self.DISCOVER_TIMEOUT_SEC,
         )
         self.device_characteristics = await self.storage_manager.load_log_async(log_type="discovery")
         self.logger.info("Connecting to device '%s'...", device_address)
@@ -426,7 +459,6 @@ class DiscoveryManager:
                             char_discover_time_utc=datetime.now(timezone.utc).isoformat(),
                         )
                         self.device_characteristics[device_address].characteristics.append(characteristic)
-
                 console.print(device_tree, end="\n")
                 await self.storage_manager.save_log_async(log_type="discovery", data=self.device_characteristics)
 
@@ -443,12 +475,15 @@ class DiscoveryManager:
 
 class MonitoringManager:
     RSSI_AVG_WINDOW = 5
-    RSSI_AVG_IMM = -45
-    RSSI_AVG_NEAR = -70
-    RSSI_AVG_FAR = -90
-    STALE_TIME = 10
+    RSSI_AVG_IMM_DB = -45
+    RSSI_AVG_NEAR_DB = -70
+    RSSI_AVG_FAR_DB = -90
+    STALE_TIME_SEC = 10
     PRIVACY_MASK_ENABLED = False
-    PRIVACY_MASK = "XX:XX:XX:XX:XX:XX"
+    MON_DATA_REFRESH_RATE_SEC = 0.25
+    MON_TABLE_REFRESH_FREQ = 4
+    ADDR_LEN_WIN = 17
+    ADDR_LEN_MAC = 36
     LOGGER_NAME = "bluescope.monitoring"
 
     def __init__(self, manufacturer_registry: ManufacturerRegistry):
@@ -458,7 +493,7 @@ class MonitoringManager:
         self.is_auto_mode = True
         self.logger = logging.getLogger(self.LOGGER_NAME)
     
-    def _on_detection(self, device: BLEDevice, advertisement_data: AdvertisementData):
+    def _on_detection(self, device: BLEDevice, advertisement_data: AdvertisementData) -> None:
         if not self.is_auto_mode and self.device_address.upper() != device.address.upper():
             return
         entry = self.monitoring_list.get(device.address)
@@ -487,13 +522,13 @@ class MonitoringManager:
         for device_entry in self.monitoring_list.values():
             if len(device_entry.device_rssi_history) == self.RSSI_AVG_WINDOW:
                 rssi_avg = sum(device_entry.device_rssi_history) / self.RSSI_AVG_WINDOW
-                if rssi_avg >= self.RSSI_AVG_IMM:
+                if rssi_avg >= self.RSSI_AVG_IMM_DB:
                     rssi_color = "bold green"
                     device_distance = "Immediate"
-                elif rssi_avg >= self.RSSI_AVG_NEAR:
+                elif rssi_avg >= self.RSSI_AVG_NEAR_DB:
                     rssi_color = "bold yellow"
                     device_distance = "Near"
-                elif rssi_avg >= self.RSSI_AVG_FAR:
+                elif rssi_avg >= self.RSSI_AVG_FAR_DB:
                     rssi_color = "bold red"
                     device_distance = "Far"
                 else:
@@ -505,7 +540,7 @@ class MonitoringManager:
                 device_distance = None
 
             entry = [
-                self.PRIVACY_MASK if self.PRIVACY_MASK_ENABLED else device_entry.device_address,
+                self.apply_privacy_mask(device_entry.device_address) if self.PRIVACY_MASK_ENABLED else device_entry.device_address,
                 device_entry.device_name if device_entry.device_name else "N/A",
                 device_entry.device_manufacturer_name if device_entry.device_manufacturer_name else "N/A",
                 Text(f"{rssi_avg}", style=rssi_color) if rssi_avg != 0 else "N/A",
@@ -515,19 +550,29 @@ class MonitoringManager:
             ]
             table.add_row(*entry)
         return table
+    
+    def apply_privacy_mask(self, address: str) -> str:
+        if ":" in address:
+            return "XX:XX:XX:XX:XX:XX" 
+        if "-" in address and len(address) == self.ADDR_LEN_WIN:
+            return "XX-XX-XX-XX-XX-XX"
+        if len(address) == self.ADDR_LEN_MAC:
+            return "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+        else:
+            return "XX:XX:XX:XX:XX:XX"
 
-    def cleanup_stale_devices(self):
+    def cleanup_stale_devices(self) -> None:
         now = datetime.now(timezone.utc)
         stale_devices = []
         for device_address, device_entry  in self.monitoring_list.items():
             if device_entry.device_last_seen_utc:
                 elapsed_time = (now - device_entry.device_last_seen_utc).total_seconds()
-                if elapsed_time > self.STALE_TIME:
+                if elapsed_time > self.STALE_TIME_SEC:
                     stale_devices.append(device_address)
         for device_address in stale_devices:
             del self.monitoring_list[device_address]
 
-    async def monitor(self, device_address: str | None = None):
+    async def monitor(self, device_address: str | None = None) -> None:
         self.monitoring_list.clear()
         self.is_auto_mode = True
         if device_address:
@@ -543,20 +588,20 @@ class MonitoringManager:
             async with scanner:
                 mask_state = "Privacy mask is ON. " if self.PRIVACY_MASK_ENABLED else ""
                 self.logger.info("Monitoring started. %sPress [CTRL+C] to terminate.", mask_state)
-                with Live(Table(), refresh_per_second=4) as live:
+                with Live(Table(), refresh_per_second=self.MON_TABLE_REFRESH_FREQ) as live:
                     while True:
                         if self.is_auto_mode:
                             self.cleanup_stale_devices()
                         monitoring_table = self.build_monitoring_table()
                         live.update(monitoring_table)
-                        await asyncio.sleep(0.25)
+                        await asyncio.sleep(self.MON_DATA_REFRESH_RATE_SEC)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
             self.logger.info("Monitoring terminated")
 
 class BlueScopeApp:
-    LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
+    LOG_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
     LOGGER_NAME = "bluescope"
 
     def __init__(self):
@@ -570,10 +615,10 @@ class BlueScopeApp:
         self.discovery_manager = DiscoveryManager(storage_manager=self.storage_manager)
         self.monitoring_manager = MonitoringManager(manufacturer_registry=self.manufacturer_registry)
 
-    def init_logging(self):
+    def init_logging(self) -> None:
 
         def utc_datetime_formatter(_datetime: datetime) -> str:
-            return _datetime.astimezone(timezone.utc).strftime(self.LOG_TIME_FORMAT)
+            return _datetime.astimezone(timezone.utc).strftime(self.LOG_DATETIME_FORMAT)
             
         formatter = logging.Formatter("%(message)s")
         formatter.converter = time.gmtime
@@ -589,11 +634,11 @@ class BlueScopeApp:
         root_logger.addHandler(rich_handler)
         self.logger = logging.getLogger(self.LOGGER_NAME)
 
-    async def run(self):
+    async def run(self) -> None:
         while self.is_running:
             await self.display_menu()
 
-    async def display_menu(self):
+    async def display_menu(self) -> None:
         menu_text = (
             f"\n{APP_NAME}\n"
             "---\n"
@@ -625,9 +670,14 @@ class BlueScopeApp:
             case "q":
                 await self.shutdown()
     
-    async def shutdown(self):
-        self.logger.info("Exiting...")
+    async def shutdown(self) -> None:
         self.is_running = False
+        self.logger.info("Clearing write queue...")
+        try:
+            await self.storage_manager.shutdown_queue_worker()
+        except Exception as e:
+            self.logger.error("Failed to clear write queue: %s", e)
+        self.logger.info("Exiting...")
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
@@ -637,10 +687,6 @@ class BlueScopeApp:
 if __name__ == "__main__":
     app = BlueScopeApp()
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop and loop.is_running:
-        loop.create_task(app.run())
-    else:
         asyncio.run(app.run())
+    except (KeyboardInterrupt, SystemExit):
+        pass
