@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 import time
+from typing import Any
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -23,7 +24,6 @@ from rich.logging import RichHandler
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
-from typing import Any
 
 APP_NAME = "BlueScope"
 console = Console()
